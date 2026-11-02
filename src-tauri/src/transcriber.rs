@@ -14,6 +14,13 @@ use tauri::{AppHandle, Emitter};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderStatus {
+    pub requested: String,
+    pub actual: String,
+    pub is_fallback: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEntry {
     pub id: u64,
     pub timestamp_str: String,
@@ -174,6 +181,7 @@ pub fn apply_custom_vocabulary_biasing(text: &str, vocab: &[String]) -> String {
 /// Advanced Whisper Recognizer with Hotwords and Deterministic Greedy Search
 pub struct AdvancedWhisperRecognizer {
     recognizer: *const sherpa_rs_sys::SherpaOnnxOfflineRecognizer,
+    pub actual_provider: String,
 }
 
 impl AdvancedWhisperRecognizer {
@@ -183,6 +191,7 @@ impl AdvancedWhisperRecognizer {
         tokens_path: &Path,
         provider: &str,
     ) -> anyhow::Result<Self> {
+        info!("Whisper Recognizer requested provider: '{}'", provider);
         let encoder_cstr = std::ffi::CString::new(encoder_path.to_string_lossy().as_bytes())?;
         let decoder_cstr = std::ffi::CString::new(decoder_path.to_string_lossy().as_bytes())?;
         let tokens_cstr = std::ffi::CString::new(tokens_path.to_string_lossy().as_bytes())?;
@@ -204,7 +213,7 @@ impl AdvancedWhisperRecognizer {
             .map(|n| n.get())
             .unwrap_or(4);
         let whisper_threads = (cpus / 2).clamp(2, 6) as i32;
-        info!("Initializing Whisper Recognizer with provider '{}' and {} threads (total cores: {})", provider, whisper_threads, cpus);
+        info!("Initializing Whisper Recognizer with requested provider '{}' and {} threads (total cores: {})", provider, whisper_threads, cpus);
 
         let model_config = unsafe {
             sherpa_rs_sys::SherpaOnnxOfflineModelConfig {
@@ -255,23 +264,27 @@ impl AdvancedWhisperRecognizer {
             }
         };
 
+        let mut actual_provider = provider.to_string();
         let mut recognizer = unsafe { sherpa_rs_sys::SherpaOnnxCreateOfflineRecognizer(&recognizer_config) };
         if recognizer.is_null() && provider != "cpu" {
-            warn!("Failed to initialize recognizer with provider '{}', falling back to 'cpu'", provider);
+            warn!("⚠️ EXECUTION PROVIDER FALLBACK: Requested execution provider '{}' failed to initialize! Falling back to 'cpu'.", provider);
             let cpu_cstr = std::ffi::CString::new("cpu")?;
             let mut cpu_model_config = model_config;
             cpu_model_config.provider = cpu_cstr.as_ptr();
             let mut cpu_rec_config = recognizer_config;
             cpu_rec_config.model_config = cpu_model_config;
             recognizer = unsafe { sherpa_rs_sys::SherpaOnnxCreateOfflineRecognizer(&cpu_rec_config) };
+            if !recognizer.is_null() {
+                actual_provider = "cpu".to_string();
+            }
         }
 
         if recognizer.is_null() {
             anyhow::bail!("Failed to create SherpaOnnx offline recognizer");
         }
 
-        info!("Advanced Whisper Recognizer initialized successfully.");
-        Ok(Self { recognizer })
+        info!("Whisper Recognizer initialized successfully: requested='{}', actual='{}'", provider, actual_provider);
+        Ok(Self { recognizer, actual_provider })
     }
 
     pub fn transcribe(&mut self, samples_16k: &[f32]) -> String {
@@ -344,7 +357,7 @@ pub fn start_transcriber_thread(
             info!("ML Inference & Transcription Worker started with device '{}'.", device);
 
             // Initialize Advanced Whisper Recognizer
-            let mut recognizer = if model_paths.whisper_encoder.exists()
+            let (mut recognizer, actual_provider) = if model_paths.whisper_encoder.exists()
                 && model_paths.whisper_decoder.exists()
                 && model_paths.whisper_tokens.exists()
             {
@@ -354,19 +367,33 @@ pub fn start_transcriber_thread(
                     &model_paths.whisper_tokens,
                     &device,
                 ) {
-                    Ok(rec) => Some(rec),
+                    Ok(rec) => {
+                        let actual = rec.actual_provider.clone();
+                        (Some(rec), actual)
+                    }
                     Err(e) => {
                         warn!("Failed to init AdvancedWhisperRecognizer with device '{}': {:?}", device, e);
-                        None
+                        (None, "none".to_string())
                     }
                 }
             } else {
                 warn!("Whisper model files not found on disk.");
-                None
+                (None, "none".to_string())
             };
 
+            let is_fallback = device != "cpu" && actual_provider == "cpu";
+            info!(
+                "Execution provider status: requested='{}', actual='{}', is_fallback={}",
+                device, actual_provider, is_fallback
+            );
+            let _ = app_handle.emit("provider-status", ProviderStatus {
+                requested: device.clone(),
+                actual: actual_provider.clone(),
+                is_fallback,
+            });
+
             // Initialize Diarizer
-            let mut diarizer = Diarizer::new(&model_paths.speaker_id_path, registry.clone(), Some(&device));
+            let mut diarizer = Diarizer::new(&model_paths.speaker_id_path, registry.clone(), Some(&actual_provider));
 
             let mut prev_speakers_count = registry.get_profiles().len();
             let mut track_b_seg_count: usize = 0;
@@ -377,6 +404,12 @@ pub fn start_transcriber_thread(
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 };
+
+                let remaining_in_queue = segment_receiver.len();
+                info!(
+                    "Segment #{} pulled from queue (remaining queued: {}) | Source: {:?} | Duration: {}ms",
+                    segment.id, remaining_in_queue, segment.source, segment.duration_ms
+                );
 
                 if !is_running.load(Ordering::Relaxed) {
                     break;
@@ -450,11 +483,26 @@ pub fn start_transcriber_thread(
                 }
 
                 // 2. Speech-to-Text Transcription with Whisper
+                let t_start = std::time::Instant::now();
                 let raw_text = if let Some(ref mut rec) = recognizer {
                     rec.transcribe(&segment.samples_16k)
                 } else {
                     format!("[Audio detected: {:.1}s]", segment.duration_ms as f32 / 1000.0)
                 };
+                let inference_ms = t_start.elapsed().as_millis() as u64;
+                let rtf = if segment.duration_ms > 0 {
+                    inference_ms as f32 / segment.duration_ms as f32
+                } else {
+                    0.0
+                };
+                info!(
+                    "ASR Inferred Segment #{} | Duration: {}ms | Inference Time: {}ms | RTF: {:.2}x | Raw output: \"{}\"",
+                    segment.id,
+                    segment.duration_ms,
+                    inference_ms,
+                    rtf,
+                    raw_text.trim()
+                );
 
                 // 3. Text Normalization, Vocabulary Biasing & Hallucination Removal
                 let normalized_text = match clean_and_normalize_transcript(&raw_text) {

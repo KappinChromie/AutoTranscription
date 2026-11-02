@@ -95,6 +95,12 @@ interface DeviceStatus {
   runtimes_dir: string;
 }
 
+interface ProviderStatus {
+  requested: string;
+  actual: string;
+  is_fallback: boolean;
+}
+
 interface DownloadProgress {
   item_id: string;
   percentage: number;
@@ -1132,7 +1138,21 @@ function setupTauriListeners() {
     updateSpeakerCounts();
   });
 
-  // 5. Download Progress Streaming
+  // 5. Active Execution Provider Status
+  listen<ProviderStatus>("provider-status", (event) => {
+    const { requested, actual, is_fallback } = event.payload;
+    if (is_fallback) {
+      deviceStatusPill.textContent = `${actual.toUpperCase()} (${requested.toUpperCase()} fallback)`;
+      deviceStatusPill.className = "status-pill warning";
+      statusText.textContent = `Live Recording (Fallback to ${actual.toUpperCase()})`;
+    } else {
+      deviceStatusPill.textContent = `Active: ${actual.toUpperCase()}`;
+      deviceStatusPill.className = "status-pill ready";
+      statusText.textContent = `Live Recording (${actual.toUpperCase()})`;
+    }
+  });
+
+  // 6. Download Progress Streaming
   listen<DownloadProgress>("download-progress", (event) => {
     const p = event.payload;
     const pct = Math.round(p.percentage);
