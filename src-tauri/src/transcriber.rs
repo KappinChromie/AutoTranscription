@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderStatus {
@@ -42,13 +42,40 @@ fn format_timestamp(ms: u64) -> String {
     format!("{:02}:{:02}:{:02}", hours, mins, s)
 }
 
+/// Detects subword and character-level repetition loops in a single token
+pub fn has_subword_loop(word: &str) -> bool {
+    let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
+    let c: Vec<char> = clean.chars().collect();
+    let n = c.len();
+    if n > 25 {
+        return true;
+    }
+    for unit in 1..=4 {
+        let min_run = if unit == 1 { 5 } else { 4 };
+        for start in 0..n {
+            let mut run = 1;
+            while start + (run + 1) * unit <= n
+                && c[start..start + unit] == c[start + run * unit..start + (run + 1) * unit]
+            {
+                run += 1;
+            }
+            if run >= min_run {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Advanced Text Normalizer & Hallucination Filter:
 /// - Strips phantom Whisper artifacts ([BLANK_AUDIO], [music], ♪, etc.)
+/// - Detects single-token subword repetition loops (has_subword_loop)
 /// - Detects multi-ngram repetition loops and compression ratio threshold (>2.4)
 /// - Normalizes repeated punctuation (".." -> ".") and capitalizes first alphanumeric letter
 pub fn clean_and_normalize_transcript(raw: &str) -> Option<String> {
     let mut text = raw.trim().to_string();
     if text.is_empty() {
+        debug!("Filter discarded segment: empty raw input");
         return None;
     }
 
@@ -73,16 +100,26 @@ pub fn clean_and_normalize_transcript(raw: &str) -> Option<String> {
 
     text = text.trim().to_string();
     if text.is_empty() {
+        debug!("Filter discarded segment: empty after phantom token removal: \"{}\"", raw);
         return None;
     }
 
     // 2. Repetition Loop Detection
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
+        debug!("Filter discarded segment: no words found after tokenization: \"{}\"", raw);
         return None;
     }
 
-    // Single-word consecutive repetition (e.g. "you you you you")
+    // 2a. Single-word character/sub-word repetition loop (e.g. "pdpdpdpdpd" or "aaaaaaaa")
+    for &w in &words {
+        if has_subword_loop(w) {
+            debug!("Filter discarded segment: sub-word repetition loop in token '{}': \"{}\"", w, raw);
+            return None;
+        }
+    }
+
+    // 2b. Single-word consecutive repetition (e.g. "you you you you")
     let mut consecutive_word_repeats = 0;
     let mut prev_clean = String::new();
     for &w in &words {
@@ -90,6 +127,7 @@ pub fn clean_and_normalize_transcript(raw: &str) -> Option<String> {
         if !clean_w.is_empty() && clean_w == prev_clean {
             consecutive_word_repeats += 1;
             if consecutive_word_repeats >= 3 {
+                debug!("Filter discarded segment: consecutive word repeat ('{}' x {}): \"{}\"", clean_w, consecutive_word_repeats + 1, raw);
                 return None;
             }
         } else {
@@ -98,7 +136,7 @@ pub fn clean_and_normalize_transcript(raw: &str) -> Option<String> {
         }
     }
 
-    // Compression ratio threshold: if total words >= 6 and ratio > 2.4
+    // 2c. Compression ratio threshold: if total words >= 6 and ratio > 2.4
     if words.len() >= 6 {
         let mut unique = HashSet::new();
         for &w in &words {
@@ -106,6 +144,7 @@ pub fn clean_and_normalize_transcript(raw: &str) -> Option<String> {
         }
         let ratio = words.len() as f32 / unique.len() as f32;
         if ratio > 2.4 {
+            debug!("Filter discarded segment: high compression ratio ({:.2} > 2.4, {} words): \"{}\"", ratio, words.len(), raw);
             return None;
         }
     }
@@ -128,11 +167,13 @@ pub fn clean_and_normalize_transcript(raw: &str) -> Option<String> {
     text = text.trim_start_matches(|c: char| c == '.' || c == ',' || c == '-' || c == ' ' || c == ';').to_string();
     text = text.trim().to_string();
     if text.is_empty() {
+        debug!("Filter discarded segment: empty after punctuation trim: \"{}\"", raw);
         return None;
     }
 
     // If text has no alphanumeric characters, discard
     if !text.chars().any(|c| c.is_alphanumeric()) {
+        debug!("Filter discarded segment: no alphanumeric characters: \"{}\"", raw);
         return None;
     }
 
@@ -580,5 +621,27 @@ mod tests {
         let vocab = vec!["Tyler".to_string(), "Discord".to_string(), "WASAPI".to_string()];
         let biased = apply_custom_vocabulary_biasing(text, &vocab);
         assert_eq!(biased, "Hey Tyler, join Discord and test WASAPI!");
+    }
+
+    #[test]
+    fn test_subword_repetition_loops_rejected() {
+        assert!(has_subword_loop("pdpdpdpdpd"));
+        assert!(has_subword_loop("aaaaaaaa"));
+        assert!(has_subword_loop("pdpdpdpdpd!"));
+        assert_eq!(clean_and_normalize_transcript("pdpdpdpdpd"), None);
+        assert_eq!(clean_and_normalize_transcript("then he said aaaaaaaa and left"), None);
+    }
+
+    #[test]
+    fn test_normal_words_and_sentences_pass() {
+        assert!(!has_subword_loop("hello"));
+        assert!(!has_subword_loop("stuff"));
+        assert!(!has_subword_loop("mississippi"));
+        assert!(!has_subword_loop("bookkeeper"));
+
+        assert_eq!(
+            clean_and_normalize_transcript("Hello stuff mississippi bookkeeper"),
+            Some("Hello stuff mississippi bookkeeper".to_string())
+        );
     }
 }
