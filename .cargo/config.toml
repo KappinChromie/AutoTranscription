@@ -1,0 +1,2 @@
+[env]
+LIBCLANG_PATH = "C:\\Users\\luche\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\site-packages\\clang\\native"

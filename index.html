@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Dual-Stream Live Transcription</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div id="app">
+      <!-- Top App Header -->
+      <header class="app-header">
+        <div class="header-brand">
+          <div class="brand-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <line x1="12" x2="12" y1="19" y2="22"/>
+            </svg>
+          </div>
+          <div class="brand-text">
+            <h1>DualStream <span class="brand-sub">Transcriber</span></h1>
+            <div id="session-status" class="session-status idle">
+              <span class="status-dot"></span>
+              <span id="status-text">Ready to Record</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Model Status & Downloader -->
+        <div id="model-status-card" class="model-status-card">
+          <span class="model-icon">⚙</span>
+          <span id="model-status-label" class="model-label">Checking models...</span>
+          <button id="btn-download-models" class="btn-download hidden">
+            <span class="btn-spinner hidden"></span>
+            <span class="btn-label">Download AI Models (~95MB)</span>
+          </button>
+        </div>
+
+        <!-- Prominent Start / Stop Button -->
+        <button id="btn-toggle-capture" class="btn-capture btn-start">
+          <svg class="icon-play" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+          <svg class="icon-stop hidden" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <rect x="5" y="5" width="14" height="14" rx="2"/>
+          </svg>
+          <span id="capture-btn-text">Start Live Capture</span>
+        </button>
+      </header>
+
+      <!-- Configuration / Device Bar -->
+      <section class="control-bar">
+        <!-- Track A: Physical Microphone -->
+        <div class="control-group">
+          <div class="group-label">
+            <span class="track-badge badge-mic">Track A</span>
+            <span>Microphone (Hardcoded "Me")</span>
+            <div class="vad-dot" id="mic-vad-led" title="VAD Speech Activity"></div>
+          </div>
+          <div class="select-wrapper">
+            <select id="mic-select" class="dropdown">
+              <option value="">Default Microphone</option>
+            </select>
+          </div>
+          <div class="meter-wrapper" title="Mic VU Meter">
+            <div id="mic-meter-bar" class="meter-bar meter-mic"></div>
+          </div>
+        </div>
+
+        <!-- Track B: Target Application / System Loopback -->
+        <div class="control-group">
+          <div class="group-label">
+            <span class="track-badge badge-app">Track B</span>
+            <span>Target Audio Stream</span>
+            <button id="btn-refresh-apps" class="btn-refresh" title="Refresh Applications">↻ Refresh</button>
+            <div class="vad-dot" id="app-vad-led" title="VAD Speech Activity"></div>
+          </div>
+          <!-- User-Friendly Interactive App Selector Trigger -->
+          <div id="app-selector-trigger" class="app-selector-trigger" title="Click to choose application or system audio">
+            <div class="selected-app-icon" id="selected-app-icon">🔊</div>
+            <div class="selected-app-info">
+              <span id="selected-app-name" class="selected-app-name">Global Desktop Audio</span>
+              <span id="selected-app-sub" class="selected-app-sub">Captures all system sounds & meetings</span>
+            </div>
+            <button class="btn-change-app" id="btn-open-app-modal">Change ▾</button>
+          </div>
+          <div class="meter-wrapper" title="App Loopback VU Meter">
+            <div id="app-meter-bar" class="meter-bar meter-app"></div>
+          </div>
+        </div>
+
+        <!-- Diarization Sensitivity Slider -->
+        <div class="control-group sensitivity-group">
+          <div class="group-label">
+            <span>Diarization Sensitivity</span>
+            <span id="similarity-value" class="slider-val">0.58</span>
+          </div>
+          <input
+            type="range"
+            id="similarity-slider"
+            min="0.45"
+            max="0.80"
+            step="0.01"
+            value="0.58"
+            class="slider"
+            title="Lower = merges similar voices into fewer speakers; Higher = stricter separation"
+          />
+          <div class="slider-hint">
+            <span>Fewer Speakers</span>
+            <span>Stricter Split</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Accuracy & Transcription Tuning Bar -->
+      <section class="accuracy-bar">
+        <!-- Whisper ASR Model Selector -->
+        <div class="accuracy-group model-selector-group">
+          <div class="group-label">
+            <span class="track-badge badge-asr">ASR Model</span>
+            <span>Whisper Recognition Engine</span>
+            <span id="whisper-status-pill" class="status-pill ready">Ready</span>
+          </div>
+          <div class="model-select-row">
+            <select id="whisper-model-select" class="dropdown" title="Select Whisper ASR model">
+              <option value="turbo">Whisper Large-v3-Turbo (Fast & Accurate - Recommended)</option>
+              <option value="small.en">Whisper Small.en (Ultra-Fast - Low CPU)</option>
+              <option value="base.en">Whisper Base.en (Standard Conversational - 74M)</option>
+              <option value="large-v3">Whisper Large-v3 (Max Accuracy - 32-Layer Heavy)</option>
+              <option value="tiny.en">Whisper Tiny.en (Fallback - 39M)</option>
+            </select>
+            <button id="btn-download-variant" class="btn-download-variant hidden">
+              <span class="btn-spinner hidden"></span>
+              <span class="btn-label">Download Model</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Inference Acceleration & Device Selector -->
+        <div class="accuracy-group device-selector-group">
+          <div class="group-label">
+            <span class="track-badge badge-device">Acceleration</span>
+            <span>Inference Device / GPU</span>
+            <span id="device-status-pill" class="status-pill ready">Ready ✓</span>
+          </div>
+          <div class="model-select-row">
+            <select id="device-select" class="dropdown" title="Select computation hardware (CPU or GPU)">
+              <option value="cpu">CPU (AVX2 Multi-threaded - Default)</option>
+              <option value="cuda">NVIDIA GPU (CUDA / Tensor Cores)</option>
+              <option value="directml">AMD / Intel GPU (DirectML / DirectX 12)</option>
+            </select>
+            <button id="btn-download-device-runtime" class="btn-download-variant hidden" title="Download GPU acceleration libraries">
+              <span class="btn-spinner hidden"></span>
+              <span class="btn-label">Download GPU Libraries</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Custom Vocabulary & Jargon Context Biasing -->
+        <div class="accuracy-group vocab-group">
+          <div class="group-label">
+            <span class="track-badge badge-vocab">Vocabulary</span>
+            <span>Custom Dictionary / Jargon Biasing</span>
+            <span id="vocab-status-pill" class="status-pill saved">Synced</span>
+          </div>
+          <div class="vocab-input-row">
+            <input
+              type="text"
+              id="custom-vocab-input"
+              class="custom-vocab-input"
+              placeholder="Comma-separated jargon/names (e.g. Discord, GG, clutch, AFK, Tyler, Sarah, Rust, WASAPI)..."
+              title="Whisper decoder is primed with these hotwords on every turn to prevent spelling and jargon errors"
+            />
+            <button id="btn-save-vocab" class="btn-save-vocab" title="Apply Hotwords to Whisper Engine">Apply</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Main 2-Column Area -->
+      <main class="main-content">
+        <!-- Left Column: Live Transcript Feed (70%) -->
+        <section class="transcript-column">
+          <div class="column-header">
+            <div class="title-with-badge">
+              <h2>Live Transcript</h2>
+              <span id="entry-count-badge" class="counter-badge">0 utterances</span>
+            </div>
+            <div class="column-actions">
+              <button id="btn-clear-transcript" class="btn-tool" title="Clear current transcript">Clear Feed</button>
+            </div>
+          </div>
+
+          <div class="transcript-feed-container" id="transcript-container">
+            <div id="transcript-feed" class="transcript-feed">
+              <div id="empty-state" class="empty-state">
+                <div class="empty-icon">🎙️</div>
+                <h3>Awaiting Audio Input</h3>
+                <p>Select your microphone and target application above, then click <strong>Start Live Capture</strong>.</p>
+                <p class="empty-sub">Speech from your microphone is automatically tagged as <strong>Me</strong>. Incoming application audio is separated by voice embeddings.</p>
+              </div>
+            </div>
+
+            <!-- Floating Jump to Live Button -->
+            <button id="btn-jump-live" class="btn-jump-live hidden">
+              <span>Jump to Live</span>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <line x1="12" y1="5" x2="12" y2="19"></line>
+                <polyline points="19 12 12 19 5 12"></polyline>
+              </svg>
+            </button>
+          </div>
+        </section>
+
+        <!-- Right Column: Speaker Roster & Session Tools (30%) -->
+        <aside class="roster-column">
+          <div class="column-header">
+            <h2>Speaker Roster</h2>
+            <span id="speaker-count-badge" class="counter-badge">1 speaker</span>
+          </div>
+
+          <div id="speaker-list" class="speaker-list">
+            <!-- Dynamically populated speaker cards -->
+          </div>
+
+          <div class="roster-footer">
+            <h3>Session Actions</h3>
+            <div class="action-buttons-grid">
+              <button id="btn-copy-transcript" class="btn-action">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                </svg>
+                <span id="copy-btn-text">Copy Transcript</span>
+              </button>
+              <button id="btn-export-txt" class="btn-action">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                <span>Export .TXT</span>
+              </button>
+              <button id="btn-export-md" class="btn-action">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/>
+                </svg>
+                <span>Export .MD</span>
+              </button>
+              <button id="btn-reset-speakers" class="btn-action btn-danger">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="1 4 1 10 7 10"/>
+                  <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+                </svg>
+                <span>Reset Speakers</span>
+              </button>
+            </div>
+          </div>
+        </aside>
+      </main>
+
+      <!-- App Picker Modal Overlay -->
+      <div id="app-modal-overlay" class="modal-overlay hidden">
+        <div class="modal-dialog">
+          <div class="modal-header">
+            <div>
+              <h3>Select Audio Source</h3>
+              <p class="modal-sub">Capture individual app processes or global system sound</p>
+            </div>
+            <button id="btn-close-app-modal" class="btn-modal-close" title="Close (Esc)">✕</button>
+          </div>
+
+          <!-- Search Bar -->
+          <div class="modal-search-box">
+            <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="8"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+            <input
+              type="text"
+              id="app-search-input"
+              class="app-search-input"
+              placeholder="Search running apps (e.g. Discord, Chrome, Spotify, game)..."
+              autocomplete="off"
+            />
+            <button id="btn-clear-search" class="btn-clear-search hidden">✕</button>
+          </div>
+
+          <!-- Filter Category Chips -->
+          <div class="filter-chips">
+            <button class="chip active" data-filter="all">All Sources</button>
+            <button class="chip" data-filter="windows">🪟 Active Windows</button>
+            <button class="chip" data-filter="voice">🎧 Voice & Chat</button>
+            <button class="chip" data-filter="browsers">🌐 Web Browsers</button>
+            <button class="chip" data-filter="global">🔊 Global Audio</button>
+          </div>
+
+          <!-- Apps List Container -->
+          <div id="modal-app-list" class="modal-app-list">
+            <!-- Dynamically populated via TypeScript -->
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
