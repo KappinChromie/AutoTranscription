@@ -95,9 +95,21 @@ impl CircularAudioBuffer {
     }
 }
 
+/// Silence gate threshold for RMS audio conditioning in dBFS:
+/// -45 dBFS = 10^(-45 / 20) ≈ 0.005623 linear
+pub const SILENCE_GATE_RMS_THRESHOLD: f32 = 0.005623;
+
+/// Maximum boost gain applied during audio conditioning (+12 dB = 10^(12 / 20) ≈ 3.981072 linear).
+/// Prevents low-level background noise from being amplified to full scale.
+pub const MAX_CONDITIONING_GAIN: f32 = 3.981072;
+
+/// Target peak amplitude (-1.0 dBFS = 10^(-1.0 / 20) ≈ 0.89125 linear)
+pub const TARGET_PEAK_AMPLITUDE: f32 = 0.89125;
+
 /// Dynamic Gain Leveling & Soft RMS AGC:
-/// - Discards segments below -45 dBFS (0.0056 linear) as background noise/silence
-/// - Normalizes peak amplitude to -1.0 dBFS (0.89125) with gentle soft tanh limiting
+/// - Discards segments below SILENCE_GATE_RMS_THRESHOLD as background noise/silence
+/// - Normalizes peak amplitude towards TARGET_PEAK_AMPLITUDE, capped at MAX_CONDITIONING_GAIN (+12 dB)
+/// - Preserves gentle soft tanh limiting above 0.70
 pub fn condition_audio_for_asr(samples: &mut Vec<f32>) -> bool {
     if samples.is_empty() {
         return false;
@@ -105,22 +117,24 @@ pub fn condition_audio_for_asr(samples: &mut Vec<f32>) -> bool {
     let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
     let rms = (sum_sq / samples.len() as f32).sqrt();
 
-    // Discard segments below -45 dBFS (0.0056)
-    if rms < 0.0056 {
+    // Discard segments below silence threshold (default: -45 dBFS / 0.005623)
+    if rms < SILENCE_GATE_RMS_THRESHOLD {
         return false;
     }
 
     let max_abs = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
     if max_abs > 1e-4 {
-        let target_peak = 0.89125f32; // -1.0 dBFS
-        let gain = target_peak / max_abs;
+        let uncapped_gain = TARGET_PEAK_AMPLITUDE / max_abs;
+        // Cap maximum applied gain to +12 dB (3.981x) to prevent amplifying low-level noise
+        let gain = uncapped_gain.min(MAX_CONDITIONING_GAIN);
+
         for s in samples.iter_mut() {
             let scaled = *s * gain;
             // Gentle tanh soft limiter above 0.70
             *s = if scaled.abs() > 0.70 {
                 let sign = scaled.signum();
                 let excess = scaled.abs() - 0.70;
-                (0.70 + (excess * 1.5).tanh() * (target_peak - 0.70)) * sign
+                (0.70 + (excess * 1.5).tanh() * (TARGET_PEAK_AMPLITUDE - 0.70)) * sign
             } else {
                 scaled
             };
@@ -625,15 +639,29 @@ mod tests {
 
     #[test]
     fn test_condition_audio_soft_agc_normalization() {
-        // Quiet voice (RMS around -30 dBFS)
+        // Moderate voice (peak around 0.20)
         let mut speech = Vec::new();
         for i in 0..1600 {
-            speech.push(0.03 * (i as f32 * 0.1).sin());
+            speech.push(0.20 * (i as f32 * 0.1).sin());
         }
         let accepted = condition_audio_for_asr(&mut speech);
         assert!(accepted, "Speech should be retained and normalized");
         let max_amp = speech.iter().copied().fold(0.0f32, |m, s| m.max(s.abs()));
-        assert!(max_amp > 0.5, "Peak amplitude should be boosted towards target level");
+        assert!(max_amp > 0.7, "Peak amplitude should be boosted towards target level");
         assert!(max_amp <= 1.0, "Limiter must not allow clipping above 1.0");
+    }
+
+    #[test]
+    fn test_condition_audio_gain_cap_at_12db() {
+        // Very quiet noise segment just above silence threshold (peak 0.02, RMS ~ 0.014 > 0.0056)
+        let mut quiet_noise = Vec::new();
+        for i in 0..1600 {
+            quiet_noise.push(0.02 * (i as f32 * 0.1).sin());
+        }
+        let accepted = condition_audio_for_asr(&mut quiet_noise);
+        assert!(accepted, "Should pass above silence threshold");
+        let max_amp = quiet_noise.iter().copied().fold(0.0f32, |m, s| m.max(s.abs()));
+        // Max gain is capped at 3.981072 (+12 dB), so peak cannot exceed 0.02 * 3.981072 ≈ 0.0796
+        assert!(max_amp <= 0.08, "Quiet audio gain must be capped at +12 dB, got max_amp: {}", max_amp);
     }
 }
