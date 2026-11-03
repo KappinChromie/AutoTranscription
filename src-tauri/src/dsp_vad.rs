@@ -3,6 +3,8 @@ use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 use sherpa_rs::silero_vad::{SileroVad, SileroVadConfig};
 use crate::segmentation::PyannoteSegmenter;
+use rubato::{Fft, FixedSync, Resampler, ResamplerConstructionError};
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -10,6 +12,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 use tracing::{info, warn};
+
+/// Flag to toggle between high-quality Rubato streaming FFT resampling and legacy 3-tap FIR decimation.
+/// Set to `false` for legacy decimate_48k_to_16k A/B testing.
+pub const USE_RUBATO_RESAMPLER: bool = true;
 
 static NEXT_SEGMENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -56,6 +62,60 @@ pub fn decimate_48k_to_16k(input: &[f32]) -> Vec<f32> {
         output.push(filtered.clamp(-1.0, 1.0));
     }
     output
+}
+
+/// Streaming FFT resampler from 48kHz mono to 16kHz mono using Rubato.
+/// Maintains internal overlap-add filter state between calls to eliminate boundary clicks.
+pub struct StreamingResampler48kTo16k {
+    resampler: Fft<f32>,
+    chunk_in: usize,
+    chunk_out: usize,
+    out_buf: Vec<f32>,
+}
+
+impl StreamingResampler48kTo16k {
+    pub fn new() -> Result<Self, ResamplerConstructionError> {
+        // 48kHz -> 16kHz is a 3:1 ratio.
+        // With chunk_size = 480 (10ms at 48kHz) and FixedSync::Both, each call processes
+        // exactly 480 input frames and yields 160 output frames.
+        let resampler = Fft::<f32>::new(48000, 16000, 480, 1, FixedSync::Both)?;
+        let chunk_in = resampler.input_frames_next();
+        let chunk_out = resampler.output_frames_next();
+        let out_buf = vec![0.0f32; chunk_out];
+        Ok(Self {
+            resampler,
+            chunk_in,
+            chunk_out,
+            out_buf,
+        })
+    }
+
+    /// Process available 48kHz samples from `raw_buf`.
+    /// Consumes full input chunks from `raw_buf` and returns the resampled 16kHz samples.
+    /// Any leftover samples (< chunk_in) remain in `raw_buf` for the next call.
+    pub fn process_from_raw(&mut self, raw_buf: &mut Vec<f32>) -> Vec<f32> {
+        let num_chunks = raw_buf.len() / self.chunk_in;
+        if num_chunks == 0 {
+            return Vec::new();
+        }
+        let mut result = Vec::with_capacity(num_chunks * self.chunk_out);
+        for chunk_idx in 0..num_chunks {
+            let start = chunk_idx * self.chunk_in;
+            let end = start + self.chunk_in;
+            let input_slice = &raw_buf[start..end];
+            if let (Ok(in_adapter), Ok(mut out_adapter)) = (
+                InterleavedSlice::new(input_slice, 1, self.chunk_in),
+                InterleavedSlice::new_mut(&mut self.out_buf[0..self.chunk_out], 1, self.chunk_out),
+            ) {
+                if let Ok((_nbr_in, nbr_out)) = self.resampler.process_into_buffer(&in_adapter, &mut out_adapter, None) {
+                    result.extend_from_slice(&self.out_buf[0..nbr_out]);
+                }
+            }
+        }
+        let consumed = num_chunks * self.chunk_in;
+        raw_buf.drain(0..consumed);
+        result
+    }
 }
 
 pub fn calculate_rms(samples: &[f32]) -> f32 {
@@ -325,6 +385,9 @@ pub fn start_dsp_vad_thread(
             let mut mic_pre_roll = CircularAudioBuffer::new(4800); // 300ms at 16kHz
             let mut app_pre_roll = CircularAudioBuffer::new(4800); // 300ms at 16kHz
 
+            let mut mic_resampler = StreamingResampler48kTo16k::new().ok();
+            let mut app_resampler = StreamingResampler48kTo16k::new().ok();
+
             let mut mic_raw_buf: Vec<f32> = Vec::with_capacity(48000);
             let mut app_raw_buf: Vec<f32> = Vec::with_capacity(48000);
 
@@ -346,22 +409,50 @@ pub fn start_dsp_vad_thread(
                     app_raw_buf.push(sample);
                 }
 
-                // Resample available mic samples (in multiples of 3 for 48k -> 16k)
-                let mic_usable_len = (mic_raw_buf.len() / 3) * 3;
-                let mic_16k = if mic_usable_len > 0 {
-                    let chunk: Vec<f32> = mic_raw_buf.drain(0..mic_usable_len).collect();
-                    decimate_48k_to_16k(&chunk)
+                // Resample available mic samples
+                let mic_16k = if USE_RUBATO_RESAMPLER {
+                    if let Some(ref mut resampler) = mic_resampler {
+                        resampler.process_from_raw(&mut mic_raw_buf)
+                    } else {
+                        let mic_usable_len = (mic_raw_buf.len() / 3) * 3;
+                        if mic_usable_len > 0 {
+                            let chunk: Vec<f32> = mic_raw_buf.drain(0..mic_usable_len).collect();
+                            decimate_48k_to_16k(&chunk)
+                        } else {
+                            Vec::new()
+                        }
+                    }
                 } else {
-                    Vec::new()
+                    let mic_usable_len = (mic_raw_buf.len() / 3) * 3;
+                    if mic_usable_len > 0 {
+                        let chunk: Vec<f32> = mic_raw_buf.drain(0..mic_usable_len).collect();
+                        decimate_48k_to_16k(&chunk)
+                    } else {
+                        Vec::new()
+                    }
                 };
 
                 // Resample available app samples
-                let app_usable_len = (app_raw_buf.len() / 3) * 3;
-                let app_16k = if app_usable_len > 0 {
-                    let chunk: Vec<f32> = app_raw_buf.drain(0..app_usable_len).collect();
-                    decimate_48k_to_16k(&chunk)
+                let app_16k = if USE_RUBATO_RESAMPLER {
+                    if let Some(ref mut resampler) = app_resampler {
+                        resampler.process_from_raw(&mut app_raw_buf)
+                    } else {
+                        let app_usable_len = (app_raw_buf.len() / 3) * 3;
+                        if app_usable_len > 0 {
+                            let chunk: Vec<f32> = app_raw_buf.drain(0..app_usable_len).collect();
+                            decimate_48k_to_16k(&chunk)
+                        } else {
+                            Vec::new()
+                        }
+                    }
                 } else {
-                    Vec::new()
+                    let app_usable_len = (app_raw_buf.len() / 3) * 3;
+                    if app_usable_len > 0 {
+                        let chunk: Vec<f32> = app_raw_buf.drain(0..app_usable_len).collect();
+                        decimate_48k_to_16k(&chunk)
+                    } else {
+                        Vec::new()
+                    }
                 };
 
                 if !mic_16k.is_empty() {
@@ -663,5 +754,21 @@ mod tests {
         let max_amp = quiet_noise.iter().copied().fold(0.0f32, |m, s| m.max(s.abs()));
         // Max gain is capped at 3.981072 (+12 dB), so peak cannot exceed 0.02 * 3.981072 ≈ 0.0796
         assert!(max_amp <= 0.08, "Quiet audio gain must be capped at +12 dB, got max_amp: {}", max_amp);
+    }
+
+    #[test]
+    fn test_rubato_streaming_resampler() {
+        let mut resampler = StreamingResampler48kTo16k::new().expect("Should init rubato resampler");
+        // Create 3 chunks of 480 samples of a 440 Hz sine wave at 48kHz
+        let mut raw_buf = Vec::new();
+        for i in 0..1440 {
+            raw_buf.push((i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 48000.0).sin());
+        }
+        let out_16k = resampler.process_from_raw(&mut raw_buf);
+        assert_eq!(raw_buf.len(), 0, "Buffer should be fully drained");
+        assert_eq!(out_16k.len(), 480, "1440 48kHz samples must produce 480 16kHz samples");
+        for &s in &out_16k {
+            assert!(s.is_finite(), "Resampled sample must be finite");
+        }
     }
 }
