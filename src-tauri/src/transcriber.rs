@@ -230,47 +230,82 @@ impl AdvancedWhisperRecognizer {
         encoder_path: &Path,
         decoder_path: &Path,
         tokens_path: &Path,
+        joiner_path: Option<&Path>,
+        model_type: &str,
         provider: &str,
     ) -> anyhow::Result<Self> {
-        info!("Whisper Recognizer requested provider: '{}'", provider);
+        let is_transducer = model_type == "nemo_transducer" || joiner_path.is_some();
+        info!(
+            "ASR Recognizer (is_transducer={}, model_type='{}') requested provider: '{}'",
+            is_transducer, model_type, provider
+        );
         let encoder_cstr = std::ffi::CString::new(encoder_path.to_string_lossy().as_bytes())?;
         let decoder_cstr = std::ffi::CString::new(decoder_path.to_string_lossy().as_bytes())?;
         let tokens_cstr = std::ffi::CString::new(tokens_path.to_string_lossy().as_bytes())?;
-        let language_cstr = std::ffi::CString::new("en")?;
-        let task_cstr = std::ffi::CString::new("transcribe")?;
         let provider_cstr = std::ffi::CString::new(provider)?;
         let decoding_method_cstr = std::ffi::CString::new("greedy_search")?; // temperature = 0.0
         let empty_cstr = std::ffi::CString::new("")?;
 
-        let whisper_config = sherpa_rs_sys::SherpaOnnxOfflineWhisperModelConfig {
-            encoder: encoder_cstr.as_ptr(),
-            decoder: decoder_cstr.as_ptr(),
-            language: language_cstr.as_ptr(),
-            task: task_cstr.as_ptr(),
-            tail_paddings: 0,
-        };
-
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let whisper_threads = (cpus / 2).clamp(2, 6) as i32;
-        info!("Initializing Whisper Recognizer with requested provider '{}' and {} threads (total cores: {})", provider, whisper_threads, cpus);
+        let asr_threads = (cpus / 2).clamp(2, 6) as i32;
+
+        let (whisper_config, transducer_config, model_type_cstr, feat_dim) = if is_transducer {
+            let joiner = joiner_path.ok_or_else(|| anyhow::anyhow!("Joiner path required for transducer model"))?;
+            let joiner_cstr = std::ffi::CString::new(joiner.to_string_lossy().as_bytes())?;
+            info!(
+                "Initializing Parakeet TDT Transducer Recognizer with requested provider '{}' and {} threads",
+                provider, asr_threads
+            );
+            let trans = sherpa_rs_sys::SherpaOnnxOfflineTransducerModelConfig {
+                encoder: encoder_cstr.as_ptr(),
+                decoder: decoder_cstr.as_ptr(),
+                joiner: joiner_cstr.into_raw(),
+            };
+            (
+                unsafe { std::mem::zeroed::<sherpa_rs_sys::SherpaOnnxOfflineWhisperModelConfig>() },
+                trans,
+                std::ffi::CString::new("nemo_transducer")?,
+                80, // NeMo Fast-Conformer mel filterbank dim
+            )
+        } else {
+            let language_cstr = std::ffi::CString::new("en")?;
+            let task_cstr = std::ffi::CString::new("transcribe")?;
+            info!(
+                "Initializing Whisper Recognizer with requested provider '{}' and {} threads (total cores: {})",
+                provider, asr_threads, cpus
+            );
+            let whisp = sherpa_rs_sys::SherpaOnnxOfflineWhisperModelConfig {
+                encoder: encoder_cstr.as_ptr(),
+                decoder: decoder_cstr.as_ptr(),
+                language: language_cstr.into_raw(),
+                task: task_cstr.into_raw(),
+                tail_paddings: 0,
+            };
+            (
+                whisp,
+                unsafe { std::mem::zeroed::<sherpa_rs_sys::SherpaOnnxOfflineTransducerModelConfig>() },
+                std::ffi::CString::new("")?,
+                512, // Whisper mel filterbank dim
+            )
+        };
 
         let model_config = unsafe {
             sherpa_rs_sys::SherpaOnnxOfflineModelConfig {
                 whisper: whisper_config,
+                transducer: transducer_config,
                 debug: 0,
-                num_threads: whisper_threads,
+                num_threads: asr_threads,
                 provider: provider_cstr.as_ptr(),
                 tokens: tokens_cstr.as_ptr(),
                 bpe_vocab: empty_cstr.as_ptr(),
-                model_type: empty_cstr.as_ptr(),
+                model_type: model_type_cstr.as_ptr(),
                 modeling_unit: empty_cstr.as_ptr(),
                 nemo_ctc: std::mem::zeroed(),
                 paraformer: std::mem::zeroed(),
                 tdnn: std::mem::zeroed(),
                 telespeech_ctc: std::mem::zeroed(),
-                transducer: std::mem::zeroed(),
                 fire_red_asr: std::mem::zeroed(),
                 sense_voice: std::mem::zeroed(),
                 moonshine: std::mem::zeroed(),
@@ -290,7 +325,7 @@ impl AdvancedWhisperRecognizer {
             sherpa_rs_sys::SherpaOnnxOfflineRecognizerConfig {
                 feat_config: sherpa_rs_sys::SherpaOnnxFeatureConfig {
                     sample_rate: 16000,
-                    feature_dim: 512,
+                    feature_dim: feat_dim,
                 },
                 model_config,
                 decoding_method: decoding_method_cstr.as_ptr(),
@@ -324,7 +359,7 @@ impl AdvancedWhisperRecognizer {
             anyhow::bail!("Failed to create SherpaOnnx offline recognizer");
         }
 
-        info!("Whisper Recognizer initialized successfully: requested='{}', actual='{}'", provider, actual_provider);
+        info!("ASR Recognizer initialized successfully: requested='{}', actual='{}'", provider, actual_provider);
         Ok(Self { recognizer, actual_provider })
     }
 
@@ -397,15 +432,20 @@ pub fn start_transcriber_thread(
         .spawn(move || {
             info!("ML Inference & Transcription Worker started with device '{}'.", device);
 
-            // Initialize Advanced Whisper Recognizer
+            // Initialize Recognizer (Whisper or Parakeet NeMo Transducer)
+            let is_parakeet = model_paths.active_whisper_variant == "parakeet-tdt";
+            let model_type = if is_parakeet { "nemo_transducer" } else { "whisper" };
             let (mut recognizer, actual_provider) = if model_paths.whisper_encoder.exists()
                 && model_paths.whisper_decoder.exists()
                 && model_paths.whisper_tokens.exists()
+                && (!is_parakeet || model_paths.whisper_joiner.as_ref().map(|p| p.exists()).unwrap_or(false))
             {
                 match AdvancedWhisperRecognizer::new(
                     &model_paths.whisper_encoder,
                     &model_paths.whisper_decoder,
                     &model_paths.whisper_tokens,
+                    model_paths.whisper_joiner.as_deref(),
+                    model_type,
                     &device,
                 ) {
                     Ok(rec) => {
@@ -413,12 +453,12 @@ pub fn start_transcriber_thread(
                         (Some(rec), actual)
                     }
                     Err(e) => {
-                        warn!("Failed to init AdvancedWhisperRecognizer with device '{}': {:?}", device, e);
+                        warn!("Failed to init ASR Recognizer ({}) with device '{}': {:?}", model_type, device, e);
                         (None, "none".to_string())
                     }
                 }
             } else {
-                warn!("Whisper model files not found on disk.");
+                warn!("ASR model files not found on disk for variant '{}'.", model_paths.active_whisper_variant);
                 (None, "none".to_string())
             };
 

@@ -53,6 +53,7 @@ pub struct ModelPaths {
     pub whisper_encoder: PathBuf,
     pub whisper_decoder: PathBuf,
     pub whisper_tokens: PathBuf,
+    pub whisper_joiner: Option<PathBuf>,
     pub active_whisper_variant: String,
 }
 
@@ -184,7 +185,81 @@ pub fn find_whisper_files_in_dir(dir: &Path) -> Option<(PathBuf, PathBuf, PathBu
     }
 }
 
+/// Find Parakeet TDT transducer files in a directory (encoder, decoder, joiner, tokens)
+pub fn find_parakeet_files_in_dir(dir: &Path) -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+    if !dir.exists() || !dir.is_dir() {
+        return None;
+    }
+    let mut encoder = None;
+    let mut decoder = None;
+    let mut joiner = None;
+    let mut tokens = None;
+
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_valid_file(&path) {
+                continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            if name.ends_with(".onnx") {
+                if name.contains("encoder") {
+                    if name.contains("int8") || encoder.is_none() {
+                        encoder = Some(path.clone());
+                    }
+                } else if name.contains("decoder") {
+                    if name.contains("int8") || decoder.is_none() {
+                        decoder = Some(path.clone());
+                    }
+                } else if name.contains("joiner") {
+                    if name.contains("int8") || joiner.is_none() {
+                        joiner = Some(path.clone());
+                    }
+                }
+            } else if (name.contains("tokens") || name == "tokens.txt") && name.ends_with(".txt") {
+                tokens = Some(path.clone());
+            }
+        }
+    }
+
+    if let (Some(enc), Some(dec), Some(join), Some(tok)) = (encoder, decoder, joiner, tokens) {
+        Some((enc, dec, join, tok))
+    } else {
+        None
+    }
+}
+
+pub fn find_parakeet_files_for_variant(models_dir: &Path) -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+    // 1. Canonical folder
+    let canonical = models_dir.join("sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8");
+    if let Some(files) = find_parakeet_files_in_dir(&canonical) {
+        return Some(files);
+    }
+
+    // 2. Any subdirectory containing "parakeet"
+    if let Ok(entries) = fs::read_dir(models_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let dirname = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                if dirname.contains("parakeet") {
+                    if let Some(files) = find_parakeet_files_in_dir(&path) {
+                        return Some(files);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Direct files in models_dir
+    find_parakeet_files_in_dir(models_dir)
+}
+
 pub fn find_whisper_files_for_variant(models_dir: &Path, variant: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    if variant == "parakeet-tdt" {
+        return find_parakeet_files_for_variant(models_dir).map(|(enc, dec, _join, tok)| (enc, dec, tok));
+    }
+
     // 1. Try canonical folder names
     let canonical_folder = match variant {
         "turbo" => "sherpa-onnx-whisper-turbo",
@@ -270,6 +345,13 @@ pub fn get_available_whisper_models(models_dir: &Path, active_variant: &str) -> 
             "Fast & Accurate - Recommended",
             "High accuracy with fast 4-layer decoder (~809M params, 8x faster than Large-v3)",
             "sherpa-onnx-whisper-turbo",
+        ),
+        (
+            "parakeet-tdt",
+            "NVIDIA Parakeet TDT 0.6B",
+            "Fast NeMo Transducer (0.6B Int8)",
+            "Ultra-low latency NVIDIA NeMo Fast-Conformer Transducer (~600M params, English)",
+            "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
         ),
         (
             "small.en",
@@ -388,6 +470,14 @@ pub fn get_model_paths_with_variant(models_dir: &Path, active_variant: Option<&s
         pyannote_direct
     };
 
+    // Check if parakeet files need joiner
+    let mut whisper_joiner = None;
+    if resolved_variant == "parakeet-tdt" {
+        if let Some((_enc, _dec, join, _tok)) = find_parakeet_files_for_variant(models_dir) {
+            whisper_joiner = Some(join);
+        }
+    }
+
     ModelPaths {
         models_dir: models_dir.to_path_buf(),
         vad_path,
@@ -396,6 +486,7 @@ pub fn get_model_paths_with_variant(models_dir: &Path, active_variant: Option<&s
         whisper_encoder,
         whisper_decoder,
         whisper_tokens,
+        whisper_joiner,
         active_whisper_variant: resolved_variant,
     }
 }
@@ -411,7 +502,9 @@ pub fn check_models_status(models_dir: &Path, active_variant: Option<&str>) -> M
     let speaker_id_ready = paths.speaker_id_path.exists() && fs::metadata(&paths.speaker_id_path).map(|m| m.len() > 1000).unwrap_or(false);
     let whisper_ready = paths.whisper_encoder.exists()
         && paths.whisper_decoder.exists()
-        && paths.whisper_tokens.exists();
+        && paths.whisper_tokens.exists()
+        && (paths.active_whisper_variant != "parakeet-tdt"
+            || paths.whisper_joiner.as_ref().map(|p| p.exists()).unwrap_or(false));
 
     let all_ready = vad_ready && pyannote_ready && speaker_id_ready && whisper_ready;
     let available_whisper_models = get_available_whisper_models(models_dir, &paths.active_whisper_variant);
@@ -659,6 +752,7 @@ pub fn download_whisper_variant_with_progress(
 
     let archive_name = match variant {
         "turbo" => "sherpa-onnx-whisper-turbo.tar.bz2",
+        "parakeet-tdt" => "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
         "small.en" => "sherpa-onnx-whisper-small.en.tar.bz2",
         "base.en" => "sherpa-onnx-whisper-base.en.tar.bz2",
         "large-v3" => "sherpa-onnx-whisper-large-v3.tar.bz2",
@@ -780,6 +874,30 @@ mod tests {
 
         let found = find_whisper_files_for_variant(&temp_dir, "turbo");
         assert!(found.is_some(), "Expected turbo to be discovered in custom named folder");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_find_parakeet_tdt_files_mock() {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("test_models_parakeet_{}", ts));
+        let parakeet_dir = temp_dir.join("sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8");
+        fs::create_dir_all(&parakeet_dir).unwrap();
+
+        let dummy = vec![0u8; 1200];
+        fs::write(parakeet_dir.join("encoder.int8.onnx"), &dummy).unwrap();
+        fs::write(parakeet_dir.join("decoder.int8.onnx"), &dummy).unwrap();
+        fs::write(parakeet_dir.join("joiner.int8.onnx"), &dummy).unwrap();
+        fs::write(parakeet_dir.join("tokens.txt"), &dummy).unwrap();
+
+        let found = find_parakeet_files_for_variant(&temp_dir);
+        assert!(found.is_some(), "Expected parakeet files to be found");
+
+        let options = get_available_whisper_models(&temp_dir, "parakeet-tdt");
+        let parakeet_opt = options.iter().find(|o| o.id == "parakeet-tdt").unwrap();
+        assert!(parakeet_opt.is_downloaded, "Parakeet should be marked downloaded");
+        assert!(parakeet_opt.is_active, "Parakeet should be marked active");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
