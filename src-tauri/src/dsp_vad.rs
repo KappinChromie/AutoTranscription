@@ -223,6 +223,19 @@ pub fn prepare_speech_segment(
     }
 
     let duration_ms = (padded.len() as u64 * 1000) / 16000;
+
+    // Optional dump of post-conditioned 16kHz audio fed to recognizer
+    if let Ok(dump_dir) = std::env::var("DUMP_SPEECH_SEGMENTS_DIR") {
+        let dump_path = PathBuf::from(dump_dir);
+        let _ = std::fs::create_dir_all(&dump_path);
+        let source_str = match &source {
+            AudioSource::Microphone => "mic",
+            AudioSource::Application { .. } => "app",
+        };
+        let file_name = format!("segment_{:04}_{}.wav", id, source_str);
+        let _ = write_wav_16k_mono(&dump_path.join(file_name), &padded);
+    }
+
     Some(SpeechSegment {
         id,
         source,
@@ -231,6 +244,45 @@ pub fn prepare_speech_segment(
         started_at_ms,
         duration_ms,
     })
+}
+
+/// Helper to write 16kHz 16-bit PCM mono WAV file to disk
+pub fn write_wav_16k_mono(path: &std::path::Path, samples: &[f32]) -> std::io::Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+    let mut file = File::create(path)?;
+    let num_samples = samples.len() as u32;
+    let byte_rate: u32 = 16000 * 2; // 16-bit mono = 32000 bytes/sec
+    let block_align = 2u16;
+    let bits_per_sample = 16u16;
+    let data_chunk_size = num_samples * 2;
+    let chunk_size = 36 + data_chunk_size;
+
+    // RIFF header
+    file.write_all(b"RIFF")?;
+    file.write_all(&chunk_size.to_le_bytes())?;
+    file.write_all(b"WAVE")?;
+
+    // fmt subchunk
+    file.write_all(b"fmt ")?;
+    file.write_all(&16u32.to_le_bytes())?; // Subchunk1Size (16 for PCM)
+    file.write_all(&1u16.to_le_bytes())?;  // AudioFormat (1 for PCM)
+    file.write_all(&1u16.to_le_bytes())?;  // NumChannels (1 = mono)
+    file.write_all(&16000u32.to_le_bytes())?; // SampleRate
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&block_align.to_le_bytes())?;
+    file.write_all(&bits_per_sample.to_le_bytes())?;
+
+    // data subchunk
+    file.write_all(b"data")?;
+    file.write_all(&data_chunk_size.to_le_bytes())?;
+    for &sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let pcm_16 = (clamped * 32767.0) as i16;
+        file.write_all(&pcm_16.to_le_bytes())?;
+    }
+    file.flush()?;
+    Ok(())
 }
 
 /// Fallback energy-based VAD state machine when ONNX Silero VAD is not loaded
