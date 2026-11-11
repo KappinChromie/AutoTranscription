@@ -2,6 +2,7 @@
 name = "live-transcriber"
 version = "0.1.0"
 edition = "2021"
+default-run = "live-transcriber"
 
 [lib]
 name = "live_transcriber_lib"
